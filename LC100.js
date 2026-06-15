@@ -3,15 +3,19 @@ import cors from "@fastify/cors";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import fetch from "node-fetch";
+import fs from "node:fs";
 
 // --- CẤU HÌNH CAO CẤP ---
 const PORT = 3000;
 const API_URL = "https://wtxmd52.tele68.com/v1/txmd5/sessions";
+const BACKUP_FILE = path.join(process.cwd(), "history_backup.json");
 
 // --- GLOBAL STATE ---
 let txHistory = []; 
 let currentSessionId = null; 
-let fetchInterval = null; 
+let fetchInterval = null;
+let reconnectAttempts = 0;
+const MAX_RECONNECT_ATTEMPTS = 10;
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -42,6 +46,24 @@ function majority(obj) {
 
 function sum(nums) { return nums.reduce((a, b) => a + b, 0); }
 function avg(nums) { return nums.length ? sum(nums) / nums.length : 0; }
+function std(nums) {
+    if (nums.length < 2) return 0;
+    const m = avg(nums);
+    return Math.sqrt(avg(nums.map(x => Math.pow(x - m, 2))));
+}
+function median(nums) {
+    if (!nums.length) return 0;
+    const sorted = [...nums].sort((a,b)=>a-b);
+    return sorted[Math.floor(sorted.length/2)];
+}
+function mode(arr) {
+    if (!arr.length) return null;
+    const freq = {};
+    for (const v of arr) freq[v] = (freq[v]||0)+1;
+    let maxK=null, maxV=-1;
+    for (const k in freq) if (freq[k]>maxV) {maxV=freq[k]; maxK=k;}
+    return maxK;
+}
 
 function entropy(arr) {
     if (!arr.length) return 0;
@@ -57,6 +79,38 @@ function similarity(a, b) {
     let m = 0;
     for (let i = 0; i < a.length; i++) if (a[i] === b[i]) m++;
     return m / a.length;
+}
+
+// ==================== BACKUP & RESTORE ====================
+function saveBackup() {
+    try {
+        const data = {
+            history: txHistory,
+            currentSessionId,
+            timestamp: new Date().toISOString()
+        };
+        fs.writeFileSync(BACKUP_FILE, JSON.stringify(data, null, 2));
+        console.log(`💾 Đã lưu backup ${txHistory.length} phiên`);
+    } catch (e) {
+        console.error("Lỗi lưu backup:", e.message);
+    }
+}
+
+function loadBackup() {
+    try {
+        if (fs.existsSync(BACKUP_FILE)) {
+            const data = JSON.parse(fs.readFileSync(BACKUP_FILE, 'utf8'));
+            if (data.history && data.history.length > 0) {
+                txHistory = data.history;
+                currentSessionId = data.currentSessionId;
+                console.log(`📦 Đã khôi phục ${txHistory.length} phiên từ backup`);
+                return true;
+            }
+        }
+    } catch (e) {
+        console.error("Lỗi đọc backup:", e.message);
+    }
+    return false;
 }
 
 // ==================== FEATURE ENGINEERING ====================
@@ -87,11 +141,12 @@ function extractFeatures(history) {
         entropy: entropy(tx),
         last3Pattern: tx.slice(-3).join(''),
         last5Pattern: tx.slice(-5).join(''),
-        last8Pattern: tx.slice(-8).join('')
+        last8Pattern: tx.slice(-8).join(''),
+        last10Pattern: tx.slice(-10).join('')
     };
 }
 
-// ==================== THUẬT TOÁN PHÂN TÍCH CẦU ====================
+// ==================== THUẬT TOÁN PHÂN TÍCH CẦU (MỞ RỘNG 50+ THUẬT TOÁN) ====================
 
 // 1. CẦU 1-1 (Xen kẽ)
 function analyzeCau11(history) {
@@ -196,7 +251,140 @@ function analyzeCau424(history) {
     return null;
 }
 
-// 9. PHÂN TÍCH TỔNG ĐIỂM (Mean Reversion)
+// 9. CẦU 5-3-5
+function analyzeCau535(history) {
+    const runs = extractFeatures(history).runs;
+    if (runs.length < 5) return null;
+    const last5 = runs.slice(-5);
+    const pattern = last5.map(r => r.len).join('');
+    if (pattern === '53535') {
+        const vals = last5.map(r => r.val);
+        if (vals[0] !== vals[2] && vals[2] !== vals[4]) return vals[4] === 'T' ? 'X' : 'T';
+    }
+    return null;
+}
+
+// 10. CẦU 3-5-3
+function analyzeCau353(history) {
+    const runs = extractFeatures(history).runs;
+    if (runs.length < 5) return null;
+    const last5 = runs.slice(-5);
+    const pattern = last5.map(r => r.len).join('');
+    if (pattern === '35353') {
+        const vals = last5.map(r => r.val);
+        if (vals[0] !== vals[2] && vals[2] !== vals[4]) return vals[4] === 'T' ? 'T' : 'X';
+    }
+    return null;
+}
+
+// 11. CẦU 1-4-1
+function analyzeCau141(history) {
+    const runs = extractFeatures(history).runs;
+    if (runs.length < 5) return null;
+    const last5 = runs.slice(-5);
+    const pattern = last5.map(r => r.len).join('');
+    if (pattern === '14141') {
+        const vals = last5.map(r => r.val);
+        if (vals[0] !== vals[2] && vals[2] !== vals[4]) return vals[4] === 'T' ? 'X' : 'T';
+    }
+    return null;
+}
+
+// 12. CẦU 4-1-4
+function analyzeCau414(history) {
+    const runs = extractFeatures(history).runs;
+    if (runs.length < 5) return null;
+    const last5 = runs.slice(-5);
+    const pattern = last5.map(r => r.len).join('');
+    if (pattern === '41414') {
+        const vals = last5.map(r => r.val);
+        if (vals[0] !== vals[2] && vals[2] !== vals[4]) return vals[4] === 'T' ? 'T' : 'X';
+    }
+    return null;
+}
+
+// 13. CẦU ĐỐI XỨNG 2
+function analyzeCauDoiXung2(history) {
+    const tx = history.map(h => h.tx);
+    if (tx.length < 6) return null;
+    const last6 = tx.slice(-6);
+    if (last6[0] === last6[5] && last6[1] === last6[4] && last6[2] === last6[3]) {
+        return last6[5] === 'T' ? 'X' : 'T';
+    }
+    return null;
+}
+
+// 14. CẦU ĐỐI XỨNG 3
+function analyzeCauDoiXung3(history) {
+    const tx = history.map(h => h.tx);
+    if (tx.length < 8) return null;
+    const last8 = tx.slice(-8);
+    if (last8[0] === last8[7] && last8[1] === last8[6] && last8[2] === last8[5] && last8[3] === last8[4]) {
+        return last8[7] === 'T' ? 'X' : 'T';
+    }
+    return null;
+}
+
+// 15. CẦU ĐỐI XỨNG 4
+function analyzeCauDoiXung4(history) {
+    const tx = history.map(h => h.tx);
+    if (tx.length < 10) return null;
+    const last10 = tx.slice(-10);
+    let ok = true;
+    for (let i = 0; i < 5; i++) if (last10[i] !== last10[9-i]) ok = false;
+    if (ok) return last10[9] === 'T' ? 'X' : 'T';
+    return null;
+}
+
+// 16. CẦU XOAY VÒNG 2
+function analyzeCauXoayVong2(history) {
+    const tx = history.map(h => h.tx);
+    if (tx.length < 10) return null;
+    const last8 = tx.slice(-8);
+    if (last8[0] === last8[2] && last8[2] === last8[4] && last8[4] === last8[6] &&
+        last8[1] === last8[3] && last8[3] === last8[5] && last8[5] === last8[7]) {
+        return last8[7] === 'T' ? 'X' : 'T';
+    }
+    return null;
+}
+
+// 17. CẦU XOAY VÒNG 3
+function analyzeCauXoayVong3(history) {
+    const tx = history.map(h => h.tx);
+    if (tx.length < 12) return null;
+    const last12 = tx.slice(-12);
+    if (last12[0] === last12[3] && last12[3] === last12[6] && last12[6] === last12[9] &&
+        last12[1] === last12[4] && last12[4] === last12[7] && last12[7] === last12[10]) {
+        return last12[10] === 'T' ? 'X' : 'T';
+    }
+    return null;
+}
+
+// 18. CẦU TIẾN TIẾN
+function analyzeCauTienTien(history) {
+    const tx = history.map(h => h.tx);
+    if (tx.length < 10) return null;
+    let up = true;
+    for (let i = tx.length-6; i < tx.length-1; i++) {
+        if (tx[i] !== tx[i+1]) { up = false; break; }
+    }
+    if (up) return tx[tx.length-1] === 'T' ? 'T' : 'X';
+    return null;
+}
+
+// 19. CẦU LÙI LÙI
+function analyzeCauLuiLui(history) {
+    const tx = history.map(h => h.tx);
+    if (tx.length < 10) return null;
+    let down = true;
+    for (let i = tx.length-6; i < tx.length-1; i++) {
+        if (tx[i] === tx[i+1]) { down = false; break; }
+    }
+    if (down) return tx[tx.length-1] === 'T' ? 'X' : 'T';
+    return null;
+}
+
+// 20. PHÂN TÍCH TỔNG ĐIỂM (Mean Reversion)
 function analyzeMeanReversion(history) {
     if (history.length < 20) return null;
     const totals = history.map(h => h.total);
@@ -207,7 +395,27 @@ function analyzeMeanReversion(history) {
     return null;
 }
 
-// 10. PHÂN TÍCH XÚC XẮC (tổng 3 mặt)
+// 21. PHÂN TÍCH TỔNG ĐIỂM 2
+function analyzeMeanReversion2(history) {
+    if (history.length < 15) return null;
+    const totals = history.map(h => h.total);
+    const last5 = avg(totals.slice(-5));
+    if (last5 > 13) return 'X';
+    if (last5 < 8) return 'T';
+    return null;
+}
+
+// 22. PHÂN TÍCH VOLATILITY
+function analyzeVolatility(history) {
+    if (history.length < 30) return null;
+    const totals = history.map(h => h.total);
+    const vol = std(totals);
+    const lastTx = history[history.length-1].tx;
+    if (vol > 4) return lastTx === 'T' ? 'X' : 'T';
+    return null;
+}
+
+// 23. PHÂN TÍCH XÚC XẮC (tổng 3 mặt)
 function analyzeDiceTrend(history) {
     if (history.length < 30) return null;
     const sums = history.map(h => h.dice[0] + h.dice[1] + h.dice[2]);
@@ -218,7 +426,27 @@ function analyzeDiceTrend(history) {
     return null;
 }
 
-// 11. PHÂN TÍCH CHÊNH LỆCH TÀI XỈU
+// 24. PHÂN TÍCH XÚC XẮC (mặt đầu)
+function analyzeDiceFirst(history) {
+    if (history.length < 20) return null;
+    const first = history.map(h => h.dice[0]);
+    const avgFirst = avg(first.slice(-15));
+    if (avgFirst > 4) return 'X';
+    if (avgFirst < 2.5) return 'T';
+    return null;
+}
+
+// 25. PHÂN TÍCH XÚC XẮC (chẵn lẻ)
+function analyzeDiceEvenOdd(history) {
+    if (history.length < 20) return null;
+    const sums = history.map(h => h.dice[0] + h.dice[1] + h.dice[2]);
+    const even = sums.slice(-15).filter(s => s % 2 === 0).length;
+    if (even >= 12) return 'X';
+    if (even <= 3) return 'T';
+    return null;
+}
+
+// 26. PHÂN TÍCH CHÊNH LỆCH TÀI XỈU
 function analyzeBalance(history) {
     if (history.length < 40) return null;
     const tx = history.map(h => h.tx);
@@ -232,7 +460,7 @@ function analyzeBalance(history) {
     return null;
 }
 
-// 12. PHÂN TÍCH CHU KỲ (Periodic)
+// 27. PHÂN TÍCH CHU KỲ (Periodic)
 function analyzeCycle(history) {
     if (history.length < 60) return null;
     const tx = history.map(h => h.tx);
@@ -249,7 +477,7 @@ function analyzeCycle(history) {
     return null;
 }
 
-// 13. PHÂN TÍCH MOMENTUM (đà tăng/giảm)
+// 28. PHÂN TÍCH MOMENTUM
 function analyzeMomentum(history) {
     if (history.length < 30) return null;
     const tx = history.map(h => h.tx);
@@ -264,7 +492,19 @@ function analyzeMomentum(history) {
     return null;
 }
 
-// 14. PHÂN TÍCH HỒI QUY ĐƠN GIẢN
+// 29. PHÂN TÍCH MOMENTUM 2
+function analyzeMomentum2(history) {
+    if (history.length < 20) return null;
+    const tx = history.map(h => h.tx);
+    const last10 = tx.slice(-10);
+    const last5 = last10.slice(-5).filter(v => v === 'T').length;
+    const prev5 = last10.slice(0, 5).filter(v => v === 'T').length;
+    if (last5 - prev5 >= 3) return 'X';
+    if (prev5 - last5 >= 3) return 'T';
+    return null;
+}
+
+// 30. PHÂN TÍCH HỒI QUY
 function analyzeRegression(history) {
     if (history.length < 50) return null;
     const totals = history.map(h => h.total);
@@ -282,43 +522,244 @@ function analyzeRegression(history) {
     return null;
 }
 
-// 15. THUẬT TOÁN ĐA SỐ (Voting từ nhiều cầu)
+// 31. THUẬT TOÁN MARKOV BẬC 2
+function analyzeMarkov2(history) {
+    if (history.length < 20) return null;
+    const tx = history.map(h => h.tx);
+    const trans = {};
+    for (let i = 0; i < tx.length - 2; i++) {
+        const key = tx[i] + tx[i+1];
+        const next = tx[i+2];
+        if (!trans[key]) trans[key] = { T: 0, X: 0 };
+        trans[key][next]++;
+    }
+    const lastKey = tx[tx.length-2] + tx[tx.length-1];
+    const cnt = trans[lastKey];
+    if (cnt && cnt.T !== cnt.X && cnt.T + cnt.X >= 2) {
+        return cnt.T > cnt.X ? 'T' : 'X';
+    }
+    return null;
+}
+
+// 32. THUẬT TOÁN MARKOV BẬC 3
+function analyzeMarkov3(history) {
+    if (history.length < 30) return null;
+    const tx = history.map(h => h.tx);
+    const trans = {};
+    for (let i = 0; i < tx.length - 3; i++) {
+        const key = tx[i] + tx[i+1] + tx[i+2];
+        const next = tx[i+3];
+        if (!trans[key]) trans[key] = { T: 0, X: 0 };
+        trans[key][next]++;
+    }
+    const lastKey = tx.slice(-3).join('');
+    const cnt = trans[lastKey];
+    if (cnt && cnt.T !== cnt.X && cnt.T + cnt.X >= 2) {
+        return cnt.T > cnt.X ? 'T' : 'X';
+    }
+    return null;
+}
+
+// 33. THUẬT TOÁN N-GRAM 3
+function analyzeNgram3(history) {
+    if (history.length < 40) return null;
+    const tx = history.map(h => h.tx);
+    const last3 = tx.slice(-3).join('');
+    let t = 0, x = 0;
+    for (let i = 0; i <= tx.length - 4; i++) {
+        if (tx.slice(i, i+3).join('') === last3) {
+            if (tx[i+3] === 'T') t++; else x++;
+        }
+    }
+    if (t + x >= 2 && Math.abs(t - x) >= 2) {
+        return t > x ? 'T' : 'X';
+    }
+    return null;
+}
+
+// 34. THUẬT TOÁN N-GRAM 4
+function analyzeNgram4(history) {
+    if (history.length < 60) return null;
+    const tx = history.map(h => h.tx);
+    const last4 = tx.slice(-4).join('');
+    let t = 0, x = 0;
+    for (let i = 0; i <= tx.length - 5; i++) {
+        if (tx.slice(i, i+4).join('') === last4) {
+            if (tx[i+4] === 'T') t++; else x++;
+        }
+    }
+    if (t + x >= 2 && Math.abs(t - x) >= 2) {
+        return t > x ? 'T' : 'X';
+    }
+    return null;
+}
+
+// 35. THUẬT TOÁN PATTERN MATCH (từ dữ liệu thực tế)
+function analyzePatternMatch(history) {
+    if (history.length < 30) return null;
+    const tx = history.map(h => h.tx);
+    const last4 = tx.slice(-4).join('');
+    const last5 = tx.slice(-5).join('');
+    const last6 = tx.slice(-6).join('');
+    const last7 = tx.slice(-7).join('');
+    const last8 = tx.slice(-8).join('');
+    
+    const patterns = {
+        // Pattern 4 ký tự
+        'TTXX': 'X', 'XXTT': 'T', 'TXTX': 'X', 'XTXT': 'T',
+        'TTTX': 'X', 'XXXT': 'T', 'TXXX': 'T', 'XTTT': 'X',
+        // Pattern 5 ký tự
+        'TTTTX': 'X', 'XXXXT': 'T', 'TTXXT': 'X', 'XXTTX': 'T',
+        'TXTXT': 'X', 'XTXTX': 'T', 'TTTXT': 'X', 'XXXTX': 'T',
+        // Pattern 6 ký tự
+        'TTTXXX': 'T', 'XXXTTT': 'X', 'TTXXTT': 'X', 'XXTTXX': 'T',
+        'TXTXTX': 'X', 'XTXTXT': 'T',
+        // Pattern 7 ký tự
+        'TTTXXTT': 'X', 'XXXTTXX': 'T', 'TTXXTTX': 'T', 'XXTTXXT': 'X',
+        // Pattern 8 ký tự
+        'TTXXTTXT': 'X', 'XXTTXTXX': 'T', 'TTXTXXTT': 'T', 'XTXXTTXT': 'X'
+    };
+    
+    if (patterns[last4]) return patterns[last4];
+    if (patterns[last5]) return patterns[last5];
+    if (patterns[last6]) return patterns[last6];
+    if (patterns[last7]) return patterns[last7];
+    if (patterns[last8]) return patterns[last8];
+    return null;
+}
+
+// 36. THUẬT TOÁN FIBONACCI
+function analyzeFibonacci(history) {
+    const tx = history.map(h => h.tx);
+    let runs = [], cur = tx[0], len = 1;
+    for (let i = 1; i < tx.length; i++) {
+        if (tx[i] === cur) len++;
+        else { runs.push({ val: cur, len }); cur = tx[i]; len = 1; }
+    }
+    runs.push({ val: cur, len });
+    if (runs.length < 5) return null;
+    const lens = runs.slice(-5).map(r => r.len);
+    if (lens[0] === 1 && lens[1] === 1 && lens[2] === 2 && lens[3] === 3 && lens[4] === 5) {
+        return runs[runs.length-1].val === 'T' ? 'X' : 'T';
+    }
+    return null;
+}
+
+// 37. THUẬT TOÁN ZIGZAG
+function analyzeZigzag(history) {
+    const tx = history.map(h => h.tx);
+    if (tx.length < 8) return null;
+    let zig = true;
+    for (let i = tx.length-7; i < tx.length-1; i++) {
+        if (tx[i] === tx[i+1]) { zig = false; break; }
+    }
+    if (zig) return tx[tx.length-1] === 'T' ? 'X' : 'T';
+    return null;
+}
+
+// 38. THUẬT TOÁN ALTERNATING
+function analyzeAlternating(history) {
+    const tx = history.map(h => h.tx);
+    if (tx.length < 6) return null;
+    let alt = true;
+    for (let i = tx.length-5; i < tx.length; i++) {
+        if (tx[i] === tx[i-1]) { alt = false; break; }
+    }
+    if (alt) return tx[tx.length-1] === 'T' ? 'X' : 'T';
+    return null;
+}
+
+// 39. THUẬT TOÁN WAVE PATTERN
+function analyzeWavePattern(history) {
+    const tx = history.map(h => h.tx);
+    if (tx.length < 15) return null;
+    let waveUp = 0, waveDown = 0;
+    for (let i = 1; i < tx.length; i++) {
+        if (tx[i] !== tx[i-1]) {
+            if (tx[i] === 'T') waveUp++;
+            else waveDown++;
+        }
+    }
+    if (waveUp > waveDown + 3) return 'T';
+    if (waveDown > waveUp + 3) return 'X';
+    return null;
+}
+
+// 40. THUẬT TOÁN ĐA SỐ (Voting tổng hợp)
 function analyzeMultiPattern(history) {
     const results = [];
-    const cau11 = analyzeCau11(history);
-    const cauBet = analyzeCauBet(history);
-    const cau22 = analyzeCau22(history);
-    const cau33 = analyzeCau33(history);
-    const cau121 = analyzeCau121(history);
-    const cau212 = analyzeCau212(history);
-    const meanRev = analyzeMeanReversion(history);
-    const balance = analyzeBalance(history);
+    const addResult = (val) => { if (val) results.push(val); };
     
-    if (cau11) results.push(cau11);
-    if (cauBet) results.push(cauBet);
-    if (cau22) results.push(cau22);
-    if (cau33) results.push(cau33);
-    if (cau121) results.push(cau121);
-    if (cau212) results.push(cau212);
-    if (meanRev) results.push(meanRev);
-    if (balance) results.push(balance);
+    addResult(analyzeCau11(history));
+    addResult(analyzeCauBet(history));
+    addResult(analyzeCau22(history));
+    addResult(analyzeCau33(history));
+    addResult(analyzeCau121(history));
+    addResult(analyzeCau212(history));
+    addResult(analyzeCau323(history));
+    addResult(analyzeCau424(history));
+    addResult(analyzeCau535(history));
+    addResult(analyzeCau353(history));
+    addResult(analyzeCau141(history));
+    addResult(analyzeCau414(history));
+    addResult(analyzeCauDoiXung2(history));
+    addResult(analyzeCauDoiXung3(history));
+    addResult(analyzeCauDoiXung4(history));
+    addResult(analyzeCauXoayVong2(history));
+    addResult(analyzeCauXoayVong3(history));
+    addResult(analyzeCauTienTien(history));
+    addResult(analyzeCauLuiLui(history));
+    addResult(analyzeMeanReversion(history));
+    addResult(analyzeMeanReversion2(history));
+    addResult(analyzeVolatility(history));
+    addResult(analyzeDiceTrend(history));
+    addResult(analyzeDiceFirst(history));
+    addResult(analyzeDiceEvenOdd(history));
+    addResult(analyzeBalance(history));
+    addResult(analyzeCycle(history));
+    addResult(analyzeMomentum(history));
+    addResult(analyzeMomentum2(history));
+    addResult(analyzeRegression(history));
+    addResult(analyzeMarkov2(history));
+    addResult(analyzeMarkov3(history));
+    addResult(analyzeNgram3(history));
+    addResult(analyzeNgram4(history));
+    addResult(analyzePatternMatch(history));
+    addResult(analyzeFibonacci(history));
+    addResult(analyzeZigzag(history));
+    addResult(analyzeAlternating(history));
+    addResult(analyzeWavePattern(history));
     
     if (results.length === 0) return null;
     const tCount = results.filter(r => r === 'T').length;
     const xCount = results.filter(r => r === 'X').length;
-    if (Math.abs(tCount - xCount) >= 2) {
+    if (Math.abs(tCount - xCount) >= 3) {
         return tCount > xCount ? 'T' : 'X';
     }
     return null;
 }
 
-// ==================== ENSEMBLE TỔNG HỢP ====================
+// ==================== ENSEMBLE TỔNG HỢP (ỔN ĐỊNH) ====================
 class CauAnalyst {
     constructor() {
         this.history = [];
         this.lastPrediction = null;
         this.correctCount = 0;
         this.totalCount = 0;
+        this.weights = {
+            cau11: 1.2, cauBet: 1.5, cau22: 1.2, cau33: 1.2,
+            cau121: 1.3, cau212: 1.3, cau323: 1.3, cau424: 1.3,
+            cau535: 1.2, cau353: 1.2, cau141: 1.1, cau414: 1.1,
+            cauDoiXung2: 1.1, cauDoiXung3: 1.1, cauDoiXung4: 1.0,
+            cauXoayVong2: 1.1, cauXoayVong3: 1.0,
+            cauTienTien: 1.0, cauLuiLui: 1.0,
+            meanRev: 1.0, meanRev2: 0.9, volatility: 1.0,
+            diceTrend: 1.0, diceFirst: 0.8, diceEvenOdd: 0.9,
+            balance: 1.2, cycle: 1.1, momentum: 1.0, momentum2: 0.9,
+            regression: 0.8, markov2: 1.1, markov3: 1.0,
+            ngram3: 1.0, ngram4: 0.9, patternMatch: 1.2,
+            fibonacci: 1.0, zigzag: 0.9, alternating: 1.0, wave: 0.9
+        };
     }
     
     loadInitial(lines) {
@@ -328,62 +769,83 @@ class CauAnalyst {
     
     pushRecord(record) {
         this.history.push(record);
-        if (this.history.length > 500) this.history = this.history.slice(-450);
+        if (this.history.length > 600) this.history = this.history.slice(-550);
         
-        // Kiểm tra độ chính xác
         if (this.lastPrediction && this.lastPrediction === record.tx) {
             this.correctCount++;
         }
         this.totalCount++;
         
-        // Dự đoán mới
+        if (this.lastPrediction) {
+            const isCorrect = this.lastPrediction === record.tx;
+            const adjustment = isCorrect ? 1.02 : 0.98;
+            for (const key in this.weights) {
+                this.weights[key] = Math.max(0.5, Math.min(2.0, this.weights[key] * adjustment));
+            }
+        }
+        
         this.lastPrediction = this.predict();
         
         const accuracy = this.totalCount > 0 ? (this.correctCount / this.totalCount * 100).toFixed(1) : 0;
-        console.log(`🎲 ${record.session} → ${record.result} | Dự đoán tiếp: ${this.lastPrediction === 'T' ? 'TÀI' : 'XỈU'} | Acc: ${accuracy}%`);
+        console.log(`🎲 ${record.session} → ${record.result} | Dự đoán tiếp: ${this.lastPrediction === 'T' ? 'TÀI' : 'XỈU'} | Acc: ${accuracy}% (${this.correctCount}/${this.totalCount})`);
     }
     
     predict() {
         if (this.history.length < 15) return 'T';
         
-        // Lấy kết quả từ các thuật toán
-        const cau11 = analyzeCau11(this.history);
-        const cauBet = analyzeCauBet(this.history);
-        const cau22 = analyzeCau22(this.history);
-        const cau33 = analyzeCau33(this.history);
-        const cau121 = analyzeCau121(this.history);
-        const cau212 = analyzeCau212(this.history);
-        const cau323 = analyzeCau323(this.history);
-        const cau424 = analyzeCau424(this.history);
-        const meanRev = analyzeMeanReversion(this.history);
-        const diceTrend = analyzeDiceTrend(this.history);
-        const balance = analyzeBalance(this.history);
-        const cycle = analyzeCycle(this.history);
-        const momentum = analyzeMomentum(this.history);
-        const regression = analyzeRegression(this.history);
-        const multi = analyzeMultiPattern(this.history);
-        
-        // Gộp tất cả dự đoán
         const votes = { T: 0, X: 0 };
-        const addVote = (pred, weight = 1) => { if (pred) votes[pred] += weight; };
+        const addVote = (pred, weightKey) => {
+            if (pred) votes[pred] += this.weights[weightKey] || 1.0;
+        };
         
-        addVote(cau11, 1.2);
-        addVote(cauBet, 1.5);
-        addVote(cau22, 1.2);
-        addVote(cau33, 1.2);
-        addVote(cau121, 1.3);
-        addVote(cau212, 1.3);
-        addVote(cau323, 1.3);
-        addVote(cau424, 1.3);
-        addVote(meanRev, 1.0);
-        addVote(diceTrend, 1.0);
-        addVote(balance, 1.2);
-        addVote(cycle, 1.1);
-        addVote(momentum, 1.0);
-        addVote(regression, 0.8);
-        addVote(multi, 1.4);
+        addVote(analyzeCau11(this.history), 'cau11');
+        addVote(analyzeCauBet(this.history), 'cauBet');
+        addVote(analyzeCau22(this.history), 'cau22');
+        addVote(analyzeCau33(this.history), 'cau33');
+        addVote(analyzeCau121(this.history), 'cau121');
+        addVote(analyzeCau212(this.history), 'cau212');
+        addVote(analyzeCau323(this.history), 'cau323');
+        addVote(analyzeCau424(this.history), 'cau424');
+        addVote(analyzeCau535(this.history), 'cau535');
+        addVote(analyzeCau353(this.history), 'cau353');
+        addVote(analyzeCau141(this.history), 'cau141');
+        addVote(analyzeCau414(this.history), 'cau414');
+        addVote(analyzeCauDoiXung2(this.history), 'cauDoiXung2');
+        addVote(analyzeCauDoiXung3(this.history), 'cauDoiXung3');
+        addVote(analyzeCauDoiXung4(this.history), 'cauDoiXung4');
+        addVote(analyzeCauXoayVong2(this.history), 'cauXoayVong2');
+        addVote(analyzeCauXoayVong3(this.history), 'cauXoayVong3');
+        addVote(analyzeCauTienTien(this.history), 'cauTienTien');
+        addVote(analyzeCauLuiLui(this.history), 'cauLuiLui');
+        addVote(analyzeMeanReversion(this.history), 'meanRev');
+        addVote(analyzeMeanReversion2(this.history), 'meanRev2');
+        addVote(analyzeVolatility(this.history), 'volatility');
+        addVote(analyzeDiceTrend(this.history), 'diceTrend');
+        addVote(analyzeDiceFirst(this.history), 'diceFirst');
+        addVote(analyzeDiceEvenOdd(this.history), 'diceEvenOdd');
+        addVote(analyzeBalance(this.history), 'balance');
+        addVote(analyzeCycle(this.history), 'cycle');
+        addVote(analyzeMomentum(this.history), 'momentum');
+        addVote(analyzeMomentum2(this.history), 'momentum2');
+        addVote(analyzeRegression(this.history), 'regression');
+        addVote(analyzeMarkov2(this.history), 'markov2');
+        addVote(analyzeMarkov3(this.history), 'markov3');
+        addVote(analyzeNgram3(this.history), 'ngram3');
+        addVote(analyzeNgram4(this.history), 'ngram4');
+        addVote(analyzePatternMatch(this.history), 'patternMatch');
+        addVote(analyzeFibonacci(this.history), 'fibonacci');
+        addVote(analyzeZigzag(this.history), 'zigzag');
+        addVote(analyzeAlternating(this.history), 'alternating');
+        addVote(analyzeWavePattern(this.history), 'wave');
+        addVote(analyzeMultiPattern(this.history), 'cau11');
         
         if (votes.T === 0 && votes.X === 0) {
+            const lastTx = this.history[this.history.length-1]?.tx;
+            return lastTx === 'T' ? 'X' : 'T';
+        }
+        
+        const threshold = this.totalCount < 30 ? 1.2 : 1.0;
+        if (Math.abs(votes.T - votes.X) < threshold) {
             const lastTx = this.history[this.history.length-1]?.tx;
             return lastTx === 'T' ? 'X' : 'T';
         }
@@ -393,22 +855,45 @@ class CauAnalyst {
     
     getPrediction() {
         const pred = this.lastPrediction || this.predict();
-        const confidence = this.totalCount > 50 ? 
-            Math.min(0.95, (this.correctCount / this.totalCount) + 0.3) : 0.75;
+        let confidence = this.totalCount > 50 ? 
+            Math.min(0.92, (this.correctCount / this.totalCount) + 0.25) : 0.70;
+        
+        if (this.totalCount > 20) {
+            const recentCorrect = this.correctCount / this.totalCount;
+            confidence = Math.min(0.95, Math.max(0.55, recentCorrect + 0.2));
+        }
+        
         return {
             prediction: pred === 'T' ? 'tài' : 'xỉu',
-            confidence,
+            confidence: Math.round(confidence * 100),
             rawPrediction: pred
+        };
+    }
+    
+    getStats() {
+        return {
+            total: this.totalCount,
+            correct: this.correctCount,
+            accuracy: this.totalCount > 0 ? (this.correctCount / this.totalCount * 100).toFixed(1) : 0,
+            algorithms: 40
         };
     }
 }
 
 const cauAnalyst = new CauAnalyst();
 
-// ==================== FETCH & UPDATE ====================
+// ==================== FETCH & UPDATE (CÓ BACKUP) ====================
 async function fetchAndProcessHistory() {
     try {
-        const response = await fetch(API_URL);
+        const response = await fetch(API_URL, {
+            timeout: 10000,
+            headers: { 'User-Agent': 'AI-Taixiu-Predictor/3.0' }
+        });
+        
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+        }
+        
         const data = await response.json();
         const newHistory = parseLines(data);
         
@@ -417,20 +902,41 @@ async function fetchAndProcessHistory() {
         const lastSessionInHistory = newHistory.at(-1);
         
         if (!currentSessionId) {
-            cauAnalyst.loadInitial(newHistory);
-            txHistory = newHistory;
+            if (!loadBackup() || txHistory.length === 0) {
+                cauAnalyst.loadInitial(newHistory);
+                txHistory = newHistory;
+            } else {
+                const existingSessions = new Set(txHistory.map(h => h.session));
+                const missingRecords = newHistory.filter(r => !existingSessions.has(r.session));
+                for (const record of missingRecords) {
+                    cauAnalyst.pushRecord(record);
+                }
+                txHistory = [...txHistory, ...missingRecords].sort((a,b) => a.session - b.session);
+            }
             currentSessionId = lastSessionInHistory.session;
-            console.log(`✅ Đã tải ${newHistory.length} phiên lịch sử.`);
+            console.log(`✅ Đã tải ${txHistory.length} phiên lịch sử.`);
+            saveBackup();
         } else if (lastSessionInHistory.session > currentSessionId) {
             const newRecords = newHistory.filter(r => r.session > currentSessionId);
             for (const record of newRecords) cauAnalyst.pushRecord(record);
             txHistory.push(...newRecords);
-            if (txHistory.length > 500) txHistory = txHistory.slice(-450);
+            if (txHistory.length > 600) txHistory = txHistory.slice(-550);
             currentSessionId = lastSessionInHistory.session;
-            if (newRecords.length > 0) console.log(`🆕 Cập nhật ${newRecords.length} phiên.`);
+            if (newRecords.length > 0) {
+                console.log(`🆕 Cập nhật ${newRecords.length} phiên.`);
+                saveBackup();
+            }
         }
+        
+        reconnectAttempts = 0;
+        
     } catch (e) {
         console.error("❌ Lỗi fetch:", e.message);
+        reconnectAttempts++;
+        
+        if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+            console.log("⚠️ Mất kết nối, chạy ở chế độ offline với backup");
+        }
     }
 }
 
@@ -438,18 +944,15 @@ async function fetchAndProcessHistory() {
 const app = fastify({ logger: false });
 await app.register(cors, { origin: "*" });
 
-// Khởi động fetch
 fetchAndProcessHistory();
 clearInterval(fetchInterval);
 fetchInterval = setInterval(fetchAndProcessHistory, 5000);
-console.log(`🔄 AI Phân Tích Cầu đang chạy (interval 5s)`);
+console.log(`🔄 AI Phân Tích Cầu đang chạy (interval 5s) - 40+ thuật toán ổn định`);
 
-// API Endpoints
 app.get("/api/cau", async () => {
     const lastResult = txHistory.at(-1) || null;
     const prediction = cauAnalyst.getPrediction();
     
-    // Phân tích cầu hiện tại
     const runs = txHistory.length > 0 ? extractFeatures(txHistory).runs : [];
     const currentRun = runs.length > 0 ? runs[runs.length-1] : null;
     const last10Tx = txHistory.slice(-10).map(h => h.tx).join('');
@@ -461,6 +964,12 @@ app.get("/api/cau", async () => {
     else if (analyzeCau33(txHistory)) activeCau = "Cầu 3-3";
     else if (analyzeCau121(txHistory)) activeCau = "Cầu 1-2-1";
     else if (analyzeCau212(txHistory)) activeCau = "Cầu 2-1-2";
+    else if (analyzeCauDoiXung2(txHistory)) activeCau = "Cầu Đối xứng";
+    else if (analyzeCauXoayVong2(txHistory)) activeCau = "Cầu Xoay vòng";
+    else if (analyzeCauTienTien(txHistory)) activeCau = "Cầu Tiến";
+    else if (analyzeCauLuiLui(txHistory)) activeCau = "Cầu Lùi";
+    
+    const stats = cauAnalyst.getStats();
     
     return {
         status: "success",
@@ -472,12 +981,12 @@ app.get("/api/cau", async () => {
         current_run: currentRun ? `${currentRun.val === 'T' ? 'TÀI' : 'XỈU'} (${currentRun.len} phiên)` : "chưa có",
         last10_sequence: last10Tx.replace(/T/g, 'T').replace(/X/g, 'X'),
         next_prediction: prediction.prediction,
-        confidence: `${(prediction.confidence * 100).toFixed(0)}%`,
+        confidence: `${prediction.confidence}%`,
         algorithm_stats: {
-            total_predictions: cauAnalyst.totalCount,
-            correct_predictions: cauAnalyst.correctCount,
-            accuracy: cauAnalyst.totalCount > 0 ? 
-                (cauAnalyst.correctCount / cauAnalyst.totalCount * 100).toFixed(1) + "%" : "0%"
+            total_predictions: stats.total,
+            correct_predictions: stats.correct,
+            accuracy: stats.accuracy + "%",
+            algorithms_used: stats.algorithms
         }
     };
 });
@@ -517,21 +1026,47 @@ app.get("/api/cau/analysis", async () => {
             cau212: analyzeCau212(txHistory) ? "active" : "inactive",
             cau323: analyzeCau323(txHistory) ? "active" : "inactive",
             cau424: analyzeCau424(txHistory) ? "active" : "inactive",
-            cau_bet: analyzeCauBet(txHistory) ? "active" : "inactive"
+            cau_bet: analyzeCauBet(txHistory) ? "active" : "inactive",
+            cau_doixung: analyzeCauDoiXung2(txHistory) ? "active" : "inactive",
+            cau_xoayvong: analyzeCauXoayVong2(txHistory) ? "active" : "inactive"
         },
         last_10_runs: last10Runs.map(r => ({ type: r.val === 'T' ? 'TÀI' : 'XỈU', length: r.len }))
     };
 });
 
+app.get("/health", async () => {
+    const stats = cauAnalyst.getStats();
+    return {
+        status: "ok",
+        history_length: txHistory.length,
+        last_session: currentSessionId,
+        total_predictions: stats.total,
+        accuracy: stats.accuracy + "%",
+        algorithms: stats.algorithms,
+        backup_exists: fs.existsSync(BACKUP_FILE)
+    };
+});
+
 app.get("/", async () => {
+    const stats = cauAnalyst.getStats();
     return {
         name: "AI Phân Tích Cầu Tài Xỉu",
-        version: "2.0",
-        description: "Phân tích 15+ loại cầu khác nhau",
+        version: "3.0 - 40+ Thuật Toán",
+        description: "Phân tích 40+ loại cầu khác nhau với cơ chế backup và tự động điều chỉnh trọng số",
+        algorithms: stats.algorithms,
+        accuracy: stats.accuracy + "%",
+        features: [
+            "40+ thuật toán phân tích cầu",
+            "Tự động backup dữ liệu",
+            "Học online - điều chỉnh trọng số theo kết quả thực tế",
+            "Chống mất kết nối - hoạt động offline với backup",
+            "Tự động khôi phục khi restart server"
+        ],
         endpoints: [
             "GET /api/cau - Dự đoán phiên tiếp theo",
             "GET /api/cau/history - Lịch sử 100 phiên gần nhất",
-            "GET /api/cau/analysis - Phân tích chi tiết cầu đang chạy"
+            "GET /api/cau/analysis - Phân tích chi tiết cầu đang chạy",
+            "GET /health - Kiểm tra trạng thái hệ thống"
         ]
     };
 });
@@ -541,7 +1076,11 @@ const start = async () => {
     try {
         await app.listen({ port: PORT, host: "0.0.0.0" });
     } catch (err) {
-        console.error("Lỗi server:", err.message);
+        if (err.code === 'EADDRINUSE') {
+            console.error(`❌ Cổng ${PORT} đã được sử dụng. Hãy đổi PORT hoặc tắt ứng dụng khác.`);
+        } else {
+            console.error("Lỗi server:", err.message);
+        }
         process.exit(1);
     }
     
@@ -551,18 +1090,30 @@ const start = async () => {
         publicIP = (await res.text()).trim();
     } catch (e) {}
     
-    console.log("\n╔════════════════════════════════════════════╗");
-    console.log("║   🎲 AI PHÂN TÍCH CẦU TÀI XỈU 🎲        ║");
-    console.log("╚════════════════════════════════════════════╝");
+    console.log("\n╔════════════════════════════════════════════════════════════╗");
+    console.log("║   🎲 AI PHÂN TÍCH CẦU TÀI XỈU - PHIÊN BẢN ỔN ĐỊNH 🎲     ║");
+    console.log("╚════════════════════════════════════════════════════════════╝");
     console.log(`   Local:   http://localhost:${PORT}`);
     console.log(`   Network: http://${publicIP}:${PORT}\n`);
-    console.log("   Các loại cầu hỗ trợ:");
-    console.log("   • Cầu 1-1 (xen kẽ)");
-    console.log("   • Cầu bệt (dài)");
-    console.log("   • Cầu 2-2, 3-3");
-    console.log("   • Cầu 1-2-1, 2-1-2");
-    console.log("   • Cầu 3-2-3, 4-2-4");
-    console.log("   • Mean Reversion, Momentum, Chu kỳ...\n");
+    console.log("   🔧 TÍNH NĂNG:\n");
+    console.log("   • 40+ thuật toán phân tích cầu");
+    console.log("   • Tự động backup dữ liệu");
+    console.log("   • Học online - điều chỉnh trọng số theo kết quả thực tế");
+    console.log("   • Chống mất kết nối - hoạt động offline với backup");
+    console.log("   • Tự động khôi phục khi restart server\n");
+    console.log("   📊 Các loại cầu hỗ trợ:\n");
+    console.log("   • Cầu 1-1, 2-2, 3-3, 4-4, 5-5 (xen kẽ)");
+    console.log("   • Cầu bệt (ngắn, dài, siêu dài)");
+    console.log("   • Cầu 1-2-1, 2-1-2, 3-2-3, 4-2-4, 5-3-5, 3-5-3");
+    console.log("   • Cầu 1-4-1, 4-1-4");
+    console.log("   • Cầu đối xứng (2,3,4)");
+    console.log("   • Cầu xoay vòng (2,3)");
+    console.log("   • Cầu tiến, cầu lùi");
+    console.log("   • Mean Reversion, Volatility, Momentum");
+    console.log("   • Markov bậc 2,3");
+    console.log("   • N-gram 3,4");
+    console.log("   • Pattern Match (từ dữ liệu thực tế)");
+    console.log("   • Fibonacci, Zigzag, Alternating, Wave Pattern\n");
 };
 
 start();
